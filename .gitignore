@@ -5,6 +5,9 @@
 destek.db
 sohbet_gecmisi.json
 telefon_sohbetleri.json
+whatsapp_sohbetleri.json
+whatsapp_ana_sohbet.json
+security.log
 notlar.txt
 
 # Python

@@ -7,49 +7,41 @@ import time
 import random
 import requests
 import datetime
-import sqlite3
+import threading
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from anthropic import Anthropic
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+
+import db
+import pii
+import audit
+import kod_gorevi
+from guardrails import GUARDRAIL_EK, sanitize_input
+from grounding import check_grounded
+from rate_limit import check_rate_limit, RateLimitExceeded
 
 load_dotenv()
 client = Anthropic()
+
+OWNER_JID = os.getenv("OWNER_JID")
+_TR_FOLD = str.maketrans("çÇıİğĞüÜöÖşŞ", "cCiIgGuUoOsS")
+_ONAY_KELIMELERI = {"evet", "ok", "onayla", "onayliyorum", "tamam"}
+_RED_KELIMELERI = {"hayir", "iptal", "vazgectim"}
 
 requests.packages.urllib3.disable_warnings()
 
 PVE_URL = "https://localhost:8006/api2/json"
 PVE_TOKEN = os.getenv("PVE_TOKEN")
+BRIDGE_URL = os.getenv("WHATSAPP_BRIDGE_URL", "http://localhost:3000")
 
-ADMIN_CHAT_ID = "6406407938"
 
 def sirkete_bildir(mesaj):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": ADMIN_CHAT_ID, "text": mesaj}
-        )
-    except requests.exceptions.RequestException:
-        pass
+    # Telegram yerine: sahibinin kendi WhatsApp sohbetine bildirim gonderilir.
+    chat_id = ana_sohbeti_oku()
+    if chat_id:
+        bridge_mesaj_gonder(chat_id, f"🔔 {mesaj}")
 
-def veritabani_hazirla():
-    baglanti = sqlite3.connect("destek.db")
-    baglanti.execute("""
-        CREATE TABLE IF NOT EXISTS talepler (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            musteri TEXT,
-            sorun TEXT,
-            tarih TEXT,
-            durum TEXT
-        )
-    """)
-    baglanti.commit()
-    baglanti.close()
-
-veritabani_hazirla()
+db.init_db()
 
 def toplama_yap(a, b):
     return a + b
@@ -160,51 +152,55 @@ def sunucu_durdur(vmid):
     )
     return f"Sunucu {vmid} durdurma isteği gönderildi."
 
-def _sadelestir(metin):
-    donusum = str.maketrans("çÇıİğĞüÜöÖşŞ", "cCiIgGuUoOsS")
-    return metin.translate(donusum).lower()
-
 def talep_olustur(musteri, sorun):
-    baglanti = sqlite3.connect("destek.db")
-    tarih = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
-    imlec = baglanti.execute(
-        "INSERT INTO talepler (musteri, sorun, tarih, durum) VALUES (?, ?, ?, ?)",
-        (musteri, sorun, tarih, "açık")
-    )
-    baglanti.commit()
-    talep_id = imlec.lastrowid
-    baglanti.close()
-    sirkete_bildir(f"🔔 Yeni destek talebi #{talep_id}\nMüşteri: {musteri}\nSorun: {sorun}")
+    talep_id = db.talep_olustur(musteri, sorun)
+    sirkete_bildir(f"Yeni destek talebi #{talep_id}\nMüşteri: {musteri}\nSorun: {sorun}")
     return f"Talep #{talep_id} olusturuldu. Musteri: {musteri}, Sorun: {sorun}"
 
 def talepleri_listele(durum=None):
-    baglanti = sqlite3.connect("destek.db")
-    satirlar = baglanti.execute(
-        "SELECT id, musteri, sorun, tarih, durum FROM talepler"
-    ).fetchall()
-    baglanti.close()
-
-    if durum:
-        hedef = _sadelestir(durum)
-        satirlar = [s for s in satirlar if _sadelestir(s[4]) == hedef]
-
+    satirlar = db.talepleri_listele(durum)
     if not satirlar:
         return "Hiç talep yok."
-
-    sonuc = []
-    for satir in satirlar:
-        sonuc.append(f"#{satir[0]} | {satir[1]} | {satir[2]} | {satir[3]} | durum: {satir[4]}")
-    return "\n".join(sonuc)
+    return "\n".join(f"#{s[0]} | {s[1]} | {s[2]} | {s[3]} | durum: {s[4]}" for s in satirlar)
 
 def talep_durumu_guncelle(talep_id, yeni_durum):
-    baglanti = sqlite3.connect("destek.db")
-    baglanti.execute("UPDATE talepler SET durum = ? WHERE id = ?", (yeni_durum, talep_id))
-    baglanti.commit()
-    etkilenen = baglanti.total_changes
-    baglanti.close()
-    if etkilenen == 0:
+    if not db.talep_durumu_guncelle(talep_id, yeni_durum):
         return f"Talep #{talep_id} bulunamadi."
     return f"Talep #{talep_id} durumu '{yeni_durum}' olarak guncellendi."
+
+def web_ara(sorgu):
+    r = requests.get(
+        "https://html.duckduckgo.com/html/",
+        params={"q": sorgu},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15
+    )
+    soup = BeautifulSoup(r.text, "html.parser")
+    sonuclar = []
+    for a in soup.select("a.result__a")[:5]:
+        baslik = a.get_text(strip=True)
+        link = a.get("href")
+        if baslik and link:
+            sonuclar.append(f"{baslik} - {link}")
+    if not sonuclar:
+        return "Sonuç bulunamadı."
+    return "\n".join(sonuclar)
+
+def sayfa_oku(url):
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+    soup = BeautifulSoup(r.text, "html.parser")
+    for etiket in soup(["script", "style"]):
+        etiket.decompose()
+    metin = soup.get_text(separator="\n")
+    satirlar = [s.strip() for s in metin.splitlines() if s.strip()]
+    sonuc = "\n".join(satirlar)[:4000]
+    # internetten gelen metin GUVENILMEZ veri: komut icerebilir, maskelenip
+    # isaretlenmeli ki model bunu talimat degil veri olarak gorsun.
+    kontrol = sanitize_input(sonuc, max_len=4000)
+    if kontrol.blocked:
+        audit.log_blocked_attempt(url, kontrol.reason, sonuc)
+        return "[Bu sayfada supheli/talimat benzeri icerik tespit edildi, atlandi.]"
+    return pii.redact(sonuc)
 
 def sunucu_loglarini_oku(vmid):
     r = requests.get(
@@ -231,52 +227,57 @@ def sunucu_loglarini_oku(vmid):
 
 araclar = [
     {
+        "name": "web_ara",
+        "description": "Internette bir konuyu arar, en alakali 5 sonucun basligini ve linkini getirir.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"sorgu": {"type": "string"}},
+            "required": ["sorgu"]
+        }
+    },
+    {
+        "name": "sayfa_oku",
+        "description": "Bir web sayfasinin linkini verince, o sayfanin yazi icerigini okuyup getirir.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"]
+        }
+    },
+    {
         "name": "toplama_yap",
         "description": "Iki sayiyi toplar.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "a": {"type": "number"},
-                "b": {"type": "number"}
-            },
+            "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
             "required": ["a", "b"]
         }
     },
     {
         "name": "zar_at",
         "description": "1 ile 6 arasinda rastgele bir zar atar.",
-        "input_schema": {
-            "type": "object",
-            "properties": {}
-        }
+        "input_schema": {"type": "object", "properties": {}}
     },
     {
         "name": "not_al",
         "description": "Bir notu dosyaya kalici olarak kaydeder.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "icerik": {"type": "string"}
-            },
+            "properties": {"icerik": {"type": "string"}},
             "required": ["icerik"]
         }
     },
     {
         "name": "notlari_oku",
         "description": "Daha once kaydedilmis tum notlari okur.",
-        "input_schema": {
-            "type": "object",
-            "properties": {}
-        }
+        "input_schema": {"type": "object", "properties": {}}
     },
     {
         "name": "hava_durumu",
         "description": "Bir sehrin su anki gercek hava durumunu (sicaklik) internetten cekip getirir.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "sehir": {"type": "string"}
-            },
+            "properties": {"sehir": {"type": "string"}},
             "required": ["sehir"]
         }
     },
@@ -296,19 +297,14 @@ araclar = [
     {
         "name": "simdiki_zaman",
         "description": "Su anki gercek tarih ve saati verir.",
-        "input_schema": {
-            "type": "object",
-            "properties": {}
-        }
+        "input_schema": {"type": "object", "properties": {}}
     },
     {
         "name": "sunucu_durumu",
         "description": "Proxmox VDS panelindeki bir sunucunun (konteynerin) su anki durumunu (calisiyor/durmus) sorgular.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "vmid": {"type": "integer"}
-            },
+            "properties": {"vmid": {"type": "integer"}},
             "required": ["vmid"]
         }
     },
@@ -317,9 +313,7 @@ araclar = [
         "description": "Proxmox VDS panelindeki bir sunucuyu (konteyneri) baslatir.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "vmid": {"type": "integer"}
-            },
+            "properties": {"vmid": {"type": "integer"}},
             "required": ["vmid"]
         }
     },
@@ -328,9 +322,7 @@ araclar = [
         "description": "Proxmox VDS panelindeki bir sunucuyu (konteyneri) durdurur.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "vmid": {"type": "integer"}
-            },
+            "properties": {"vmid": {"type": "integer"}},
             "required": ["vmid"]
         }
     },
@@ -339,9 +331,7 @@ araclar = [
         "description": "Bir sunucunun CPU, RAM, disk ve ag kullanimini detayli sekilde verir (yavaslik/dolu disk gibi sorunlari teshis etmek icin).",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "vmid": {"type": "integer"}
-            },
+            "properties": {"vmid": {"type": "integer"}},
             "required": ["vmid"]
         }
     },
@@ -350,9 +340,7 @@ araclar = [
         "description": "Bir sunucuda en son yapilan islemin (baslatma, durdurma vb.) gercek log kayitlarini okur, sorun teshisi icin kullanilir.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "vmid": {"type": "integer"}
-            },
+            "properties": {"vmid": {"type": "integer"}},
             "required": ["vmid"]
         }
     },
@@ -373,9 +361,7 @@ araclar = [
         "description": "Kayitli destek taleplerini listeler. Durum belirtilirse (acik/kapali) sadece o durumdakileri gosterir.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "durum": {"type": "string", "description": "Filtrelenecek durum, ornegin 'acik' veya 'kapali'. Bos birakilirsa hepsi listelenir."}
-            }
+            "properties": {"durum": {"type": "string", "description": "Filtrelenecek durum, ornegin 'acik' veya 'kapali'. Bos birakilirsa hepsi listelenir."}}
         }
     },
     {
@@ -396,7 +382,7 @@ SISTEM_PROMPT = """Sen bir hosting/VDS şirketinin müşteri destek ve sistem y�
 
 Görevin: müşterilerin VDS, hosting ve domain ile ilgili sorularına yardımcı olmak, sunucu durumlarını
 kontrol etmek, kaynak kullanımı ve log analiziyle sorun teşhisi yapmak, günlük sohbet edebilmek.
-Şu an Telegram üzerinden, telefondan yazan biriyle konuşuyorsun.
+Şu an WhatsApp üzerinden, telefondan yazan biriyle konuşuyorsun.
 
 Kurallar:
 - Müşterilerle her zaman kibar, net ve profesyonel Türkçe konuş.
@@ -411,14 +397,27 @@ Kurallar:
 - Domain/hosting genel sorularında (DNS, yenileme, transfer nedir gibi) kendi bilgini kullanarak yardımcı ol.
 - Ödeme, iptal, domain transferi gibi hassas/geri döndürülemez işlemlerde tahmin yürütme —
   bunun bir insan yetkiliye (yöneticiye) iletilmesi gerektiğini söyle.
-- Telefon ekranında okunacağı için kısa ve anlaşılır cevaplar ver, gereksiz uzatma."""
+- İlk selamlaşmada sadece "Merhaba! Size nasıl yardımcı olabilirim?" gibi genel, sıcak bir
+  karşılama yap. VDS/hosting/domain konusunu zorla gündeme getirme.
+- Bir sorunu çözdüğünde veya bir konuyu kapattığında "Başka bir konuda yardımcı olabilir miyim?"
+  diye sorabilirsin.
+- Müşteri sıradan/günlük bir konuda sohbet ediyorsa (bir sorun bildirmiyorsa) normal, doğal
+  sohbet et. Her cevabının sonuna "VDS/hosting sorununuz var mı" tarzı sorular ekleme, bu
+  gereksiz ve sıkıcı olur.
+- Telefon ekranında okunacağı için kısa ve anlaşılır cevaplar ver, gereksiz uzatma.
+- Internetten bir şey araştırman gerekirse web_ara ve sayfa_oku araçlarını kullanabilirsin.""" + GUARDRAIL_EK
 
 KRITIK_ARACLAR = {"sunucu_baslat", "sunucu_durdur"}
 
-def araci_calistir(isim, girdi, yetkili=True):
+def araci_calistir(isim, girdi, yetkili=True, chat_id=None):
     if isim in KRITIK_ARACLAR and not yetkili:
+        audit.log_unauthorized_tool(chat_id or "unknown", isim, girdi)
         sirkete_bildir(f"⚠️ Yetkisiz erişim denemesi: '{isim}' araci, girdi: {girdi}")
         return "Bu islem sadece yetkili yoneticiler tarafindan yapilabilir. Talebiniz bir yetkiliye iletildi."
+    if isim == "web_ara":
+        return web_ara(girdi["sorgu"])
+    if isim == "sayfa_oku":
+        return sayfa_oku(girdi["url"])
     if isim == "toplama_yap":
         return toplama_yap(girdi["a"], girdi["b"])
     if isim == "zar_at":
@@ -450,8 +449,7 @@ def araci_calistir(isim, girdi, yetkili=True):
     if isim == "talep_durumu_guncelle":
         return talep_durumu_guncelle(girdi["talep_id"], girdi["yeni_durum"])
 
-# Telegram'da birden fazla kisi/sohbet olabilir, her sohbetin (chat_id) kendi hafizasi olsun.
-SOHBET_DOSYASI = "telefon_sohbetleri.json"
+SOHBET_DOSYASI = "whatsapp_sohbetleri.json"
 
 def gecmisleri_yukle():
     try:
@@ -468,9 +466,10 @@ sohbet_gecmisleri = gecmisleri_yukle()
 
 def claude_ile_konus(chat_id, mesaj):
     chat_id = str(chat_id)
-    yetkili = (chat_id == ADMIN_CHAT_ID)
+    yetkili = True  # WhatsApp bridge'i zaten sadece sahibinin kendi mesajlarini isliyor (self-chat modu)
     gecmis = sohbet_gecmisleri.setdefault(chat_id, [])
-    gecmis.append({"role": "user", "content": mesaj})
+    gecmis.append({"role": "user", "content": pii.redact(mesaj)})
+    tur_arac_ciktilari = []
 
     while True:
         cevap = client.messages.create(
@@ -490,65 +489,142 @@ def claude_ile_konus(chat_id, mesaj):
             if parca.type == "tool_use":
                 hata_var = False
                 try:
-                    sonuc = araci_calistir(parca.name, parca.input, yetkili)
+                    sonuc = araci_calistir(parca.name, parca.input, yetkili, chat_id)
                 except Exception as e:
                     sonuc = f"Hata olustu: {e}"
                     hata_var = True
+                sonuc = pii.redact(str(sonuc))
+                tur_arac_ciktilari.append(sonuc)
                 arac_sonuclari.append({
                     "type": "tool_result",
                     "tool_use_id": parca.id,
-                    "content": str(sonuc),
+                    "content": sonuc,
                     "is_error": hata_var
                 })
 
         if not arac_sonuclari:
             gecmisleri_kaydet()
-            return "\n".join(metin_parcalari) if metin_parcalari else "..."
+            metin = "\n".join(metin_parcalari) if metin_parcalari else "..."
+            saglam, guvenli_metin = check_grounded(metin, tur_arac_ciktilari)
+            if not saglam:
+                audit.log_blocked_attempt(chat_id, "hallucination", metin)
+            return guvenli_metin
 
         gecmis.append({"role": "user", "content": arac_sonuclari})
 
-HIZ_SINIRI = 10  # dakikada kisi basi max mesaj
-mesaj_zamanlari = {}
+ANA_SOHBET_DOSYASI = "whatsapp_ana_sohbet.json"
 
-def hiz_sinirini_kontrol_et(chat_id):
-    simdi = time.time()
-    zamanlar = mesaj_zamanlari.setdefault(chat_id, [])
-    zamanlar[:] = [t for t in zamanlar if simdi - t < 60]
-    if len(zamanlar) >= HIZ_SINIRI:
-        return False
-    zamanlar.append(simdi)
-    return True
+def ana_sohbeti_kaydet(chat_id):
+    with open(ANA_SOHBET_DOSYASI, "w", encoding="utf-8") as f:
+        json.dump({"chat_id": chat_id}, f)
 
-async def mesaj_geldi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not hiz_sinirini_kontrol_et(chat_id):
-        await update.message.reply_text("Çok hızlı mesaj gönderiyorsunuz, lütfen bir dakika bekleyip tekrar deneyin.")
-        return
-    kullanici_mesaji = update.message.text
-    cevap_metni = claude_ile_konus(chat_id, kullanici_mesaji)
-    await update.message.reply_text(cevap_metni)
+def ana_sohbeti_oku():
+    try:
+        with open(ANA_SOHBET_DOSYASI, "r", encoding="utf-8") as f:
+            return json.load(f).get("chat_id")
+    except FileNotFoundError:
+        return None
 
-async def baslat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Merhaba! Ben senin VDS/hosting destek ajanınım. "
-        "Sunucu durumu, kaynak kullanımı, hava durumu, hesaplama gibi konularda yardımcı olabilirim. "
-        "Bana yazman yeterli."
-    )
+AKSAM_OZETI_SAATI = "20:00"
+
+def aksam_ozeti_dongusu():
+    gonderilen_gun = None
+    while True:
+        time.sleep(30)
+        simdi = datetime.datetime.now()
+        hedef_saat, hedef_dakika = map(int, AKSAM_OZETI_SAATI.split(":"))
+        if simdi.hour == hedef_saat and simdi.minute == hedef_dakika and gonderilen_gun != simdi.date():
+            chat_id = ana_sohbeti_oku()
+            if chat_id:
+                try:
+                    cevap = claude_ile_konus(
+                        chat_id,
+                        "Bugünün Türkiye ve dünya gündemindeki en önemli 3-4 haberini web_ara ve sayfa_oku "
+                        "araçlarıyla araştır, kısa bir akşam özeti olarak sun."
+                    )
+                    bridge_mesaj_gonder(chat_id, "🌙 Akşam Özeti\n\n" + cevap)
+                except Exception as e:
+                    print(f"Aksam ozeti hatasi: {e}")
+            gonderilen_gun = simdi.date()
+
+def bridge_mesajlari_al():
+    r = requests.get(f"{BRIDGE_URL}/messages", timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def bridge_mesaj_gonder(chat_id, metin):
+    requests.post(f"{BRIDGE_URL}/send", json={"chatId": chat_id, "message": metin}, timeout=15)
 
 def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        print("HATA: .env dosyasında TELEGRAM_BOT_TOKEN yok.")
-        print("Önce Telegram'da @BotFather'a yaz, /newbot ile bir bot oluştur, verdiği token'ı")
-        print(".env dosyasına şu şekilde ekle: TELEGRAM_BOT_TOKEN=aldığın_token")
-        return
+    print("WhatsApp botu calisiyor, kendine mesaj yazabilirsin...")
+    threading.Thread(target=aksam_ozeti_dongusu, daemon=True).start()
+    while True:
+        try:
+            mesajlar = bridge_mesajlari_al()
+        except requests.exceptions.RequestException as e:
+            print(f"Bridge'e baglanilamadi: {e}")
+            time.sleep(5)
+            continue
 
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start", baslat))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mesaj_geldi))
+        for olay in mesajlar:
+            metin = olay.get("body", "").strip()
+            chat_id = olay.get("chatId")
+            if not metin or not chat_id:
+                continue
 
-    print("Telegram botu çalışıyor, telefonundan mesaj yazabilirsin...")
-    app.run_polling()
+            if ana_sohbeti_oku() != chat_id:
+                ana_sohbeti_kaydet(chat_id)
+
+            try:
+                check_rate_limit(chat_id)
+            except RateLimitExceeded:
+                audit.log_rate_limited(chat_id)
+                bridge_mesaj_gonder(chat_id, "Çok hızlı mesaj gönderiyorsunuz, lütfen bir dakika bekleyip tekrar deneyin.")
+                continue
+            metin_sade = metin.strip().translate(_TR_FOLD).lower()
+
+            if metin.strip().lower().startswith("/kod "):
+                if chat_id != OWNER_JID:
+                    audit.log_unauthorized_tool(chat_id, "kod_gorevi", metin)
+                    continue
+                gorev = metin.strip()[5:].strip()
+                print(f"[kod_gorevi] plan isteniyor: {gorev}")
+                bridge_mesaj_gonder(chat_id, "Plan hazırlanıyor, biraz sürebilir...")
+                try:
+                    plan = kod_gorevi.gorev_plani_iste(chat_id, gorev)
+                except Exception as e:
+                    plan = f"Plan olusturulamadi: {e}"
+                bridge_mesaj_gonder(chat_id, f"📋 Plan:\n\n{plan}\n\nUygulayayım mı? ('evet' ya da 'hayır' yaz)")
+                continue
+
+            if chat_id == OWNER_JID and kod_gorevi.bekleyen_plan_var_mi(chat_id):
+                if metin_sade in _ONAY_KELIMELERI:
+                    bridge_mesaj_gonder(chat_id, "Uygulaniyor, biraz sürebilir...")
+                    try:
+                        sonuc_metni = kod_gorevi.plani_onayla(chat_id)
+                    except Exception as e:
+                        sonuc_metni = f"Hata olustu: {e}"
+                    bridge_mesaj_gonder(chat_id, f"✅ {sonuc_metni}")
+                    continue
+                if metin_sade in _RED_KELIMELERI:
+                    bridge_mesaj_gonder(chat_id, kod_gorevi.plani_reddet(chat_id))
+                    continue
+
+            sonuc = sanitize_input(metin)
+            if sonuc.blocked:
+                audit.log_blocked_attempt(chat_id, sonuc.reason, metin)
+                bridge_mesaj_gonder(chat_id, "Bu konuda yardımcı olamam.")
+                continue
+
+            print(f"Gelen: {metin}")
+            try:
+                cevap = claude_ile_konus(chat_id, sonuc.clean_text)
+            except Exception as e:
+                cevap = f"Bir hata oluştu: {e}"
+            print(f"Cevap: {cevap}")
+            bridge_mesaj_gonder(chat_id, cevap)
+
+        time.sleep(2)
 
 if __name__ == "__main__":
     main()

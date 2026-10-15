@@ -18,19 +18,8 @@ requests.packages.urllib3.disable_warnings()
 PVE_URL = "https://localhost:8006/api2/json"
 PVE_TOKEN = os.getenv("PVE_TOKEN")
 
-ADMIN_CHAT_ID = "6406407938"
-
 def sirkete_bildir(mesaj):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": ADMIN_CHAT_ID, "text": mesaj}
-        )
-    except requests.exceptions.RequestException:
-        pass
+    print(f"[BILDIRIM] {mesaj}")
 
 def veritabani_hazirla():
     baglanti = sqlite3.connect("destek.db")
@@ -407,6 +396,13 @@ Kurallar:
 - Domain/hosting genel sorularında (DNS, yenileme, transfer nedir gibi) kendi bilgini kullanarak yardımcı ol.
 - Ödeme, iptal, domain transferi gibi hassas/geri döndürülemez işlemlerde tahmin yürütme —
   bunun bir insan yetkiliye (yöneticiye) iletilmesi gerektiğini söyle.
+- İlk selamlaşmada sadece "Merhaba! Size nasıl yardımcı olabilirim?" gibi genel, sıcak bir
+  karşılama yap. VDS/hosting/domain konusunu zorla gündeme getirme.
+- Bir sorunu çözdüğünde veya bir konuyu kapattığında "Başka bir konuda yardımcı olabilir miyim?"
+  diye sorabilirsin.
+- Müşteri sıradan/günlük bir konuda sohbet ediyorsa (bir sorun bildirmiyorsa) normal, doğal
+  sohbet et. Her cevabının sonuna "VDS/hosting sorununuz var mı" tarzı sorular ekleme, bu
+  gereksiz ve sıkıcı olur.
 - Kısa ve anlaşılır cevaplar ver, gereksiz uzatma."""
 
 KRITIK_ARACLAR = {"sunucu_baslat", "sunucu_durdur"}
