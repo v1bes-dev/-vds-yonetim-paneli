@@ -4,3 +4,4 @@ requests>=2.34.2
 pytest>=9.1.1
 beautifulsoup4>=4.15.0
 redis>=5.2.1
+claude-agent-sdk>=0.2.167

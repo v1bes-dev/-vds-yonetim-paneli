@@ -71,7 +71,8 @@ async def _plan_olustur_async(gorev: str):
 
 async def _plani_uygula_async(session_id: str) -> str:
     options = ClaudeAgentOptions(
-        permission_mode="acceptEdits",
+               permission_mode="bypassPermissions",
+
         resume=session_id,
         cwd=PROJE_KLASORU,
         max_turns=MAX_TURNS,
